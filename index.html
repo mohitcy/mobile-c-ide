@@ -1,0 +1,195 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mobile C-family IDE</title>
+
+  <!-- CodeMirror 5 (CDN) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/monokai.min.css" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 0; padding: 12px; background:#0f1720; color:#e6eef8; }
+    header { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+    h1 { font-size:16px; margin:0; }
+    .toolbar { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+    select, button, input { font-size:14px; padding:8px; border-radius:8px; border: none; }
+    #editor-wrap { height: 45vh; border-radius:8px; overflow:hidden; margin-top:10px; box-shadow: 0 6px 18px rgba(0,0,0,.6); }
+    #output { background:#001219; color:#cbd5e1; margin-top:10px; padding:12px; border-radius:8px; min-height: 14vh; white-space:pre-wrap; }
+    .small { font-size:12px; opacity:0.8; }
+    @media (max-width:420px){ #editor-wrap { height: 36vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Mobile C-family IDE</h1>
+    <div class="small"> — type, run, repeat</div>
+  </header>
+
+  <div class="toolbar">
+    <label for="lang">Language</label>
+    <select id="lang"></select>
+
+    <button id="runBtn">Run ▶</button>
+    <button id="sampleBtn">Load Sample</button>
+    <input id="stdin" placeholder="stdin (optional)" style="min-width:140px" />
+  </div>
+
+  <div id="editor-wrap">
+    <textarea id="code">
+// Hello — try this C program.
+// Press Run.
+
+#include <stdio.h>
+int main() {
+  printf("Hello from phone IDE!\n");
+  return 0;
+}
+    </textarea>
+  </div>
+
+  <pre id="output">Output will appear here.</pre>
+
+  <!-- CodeMirror JS -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/clike/clike.min.js"></script>
+
+  <script>
+  // --- Mobile IDE client: talks to Judge0 CE ---
+  const API_BASE = 'https://ce.judge0.com'; // public Judge0 CE host
+  const langSelect = document.getElementById('lang');
+  const runBtn = document.getElementById('runBtn');
+  const sampleBtn = document.getElementById('sampleBtn');
+  const stdinInput = document.getElementById('stdin');
+  const output = document.getElementById('output');
+
+  // CodeMirror editor
+  const editor = CodeMirror.fromTextArea(document.getElementById('code'), {
+    lineNumbers: true,
+    mode: 'text/x-csrc',
+    theme: 'monokai',
+    viewportMargin: Infinity,
+    indentUnit: 4,
+    tabSize: 4
+  });
+
+  // sleep helper
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Load languages (filter to C family)
+  async function loadLanguages() {
+    try {
+      const res = await fetch(API_BASE + '/languages');
+      const all = await res.json();
+      // Pick languages whose name suggests C/C++/Obj-C variants
+      const picks = all.filter(l => /(^C(\\b|\\s|\\()|C\\+\\+|Objective-C|objc)/i.test(l.name));
+      // If nothing found (unlikely), fallback to entire list
+      const list = picks.length ? picks : all;
+      list.forEach(l => {
+        const opt = document.createElement('option');
+        opt.value = l.id;
+        opt.textContent = l.name; 
+        langSelect.appendChild(opt);
+      });
+      // Pick a sane default: try to select a C (GCC) or C (Clang) or C++ entry first
+      const prefer = Array.from(langSelect.options).find(o => /C \\(|C\\+\\+|Clang|GCC/i.test(o.text));
+      if (prefer) langSelect.value = prefer.value;
+      // adjust editor mode on change
+      langSelect.onchange = () => adjustMode();
+      adjustMode();
+    } catch (e) {
+      output.textContent = 'Could not fetch language list from Judge0 — check network. You can still paste a language id into the selector value.';
+      console.error(e);
+    }
+  }
+
+  function adjustMode() {
+    const name = langSelect.options[langSelect.selectedIndex]?.text || '';
+    if (/\\+\\+/.test(name)) editor.setOption('mode', 'text/x-c++src');
+    else if (/Objective/i.test(name) || /objc/i.test(name)) editor.setOption('mode', 'text/x-objectivec');
+    else editor.setOption('mode', 'text/x-csrc');
+  }
+
+  // Create a submission (async) -> returns token
+  async function createSubmission(source, language_id, stdin='') {
+    const body = {
+      source_code: source,
+      language_id: Number(language_id),
+      stdin: stdin
+    };
+    const resp = await fetch(API_BASE + '/submissions/?base64_encoded=false&wait=false', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    return resp.json(); // contains token
+  }
+
+  // Poll submission by token
+  async function pollSubmission(token, timeoutMs = 20000) {
+    const url = API_BASE + '/submissions/' + encodeURIComponent(token) + '?base64_encoded=false';
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const r = await fetch(url);
+      const j = await r.json();
+      if (j && j.status && j.status.id >= 3) return j;
+      await sleep(1200);
+    }
+    throw new Error('Execution timed out (polling).');
+  }
+
+  // Run sequence
+  async function runCode() {
+    runBtn.disabled = true;
+    output.textContent = 'Sending code to compiler service...';
+    try {
+      const source = editor.getValue();
+      const lang = langSelect.value;
+      const stdin = stdinInput.value || '';
+
+      const creation = await createSubmission(source, lang, stdin);
+      if (!creation.token) { output.textContent = 'Failed to create submission: ' + JSON.stringify(creation); runBtn.disabled=false; return; }
+      output.textContent = 'Queued. Token: ' + creation.token + '\\nPolling for result...';
+
+      const result = await pollSubmission(creation.token, 25000);
+      // build display
+      let out = 'Status: ' + (result.status?.description || 'Unknown') + '\\n';
+      out += 'Time: ' + (result.time || 'n/a') + 's  Memory: ' + (result.memory || 'n/a') + ' KB\\n\\n';
+      if (result.compile_output) out += '--- Compiler Output ---\\n' + result.compile_output + '\\n\\n';
+      if (result.stdout) out += '--- STDOUT ---\\n' + atobSafe(result.stdout) + '\\n\\n';
+      if (result.stderr) out += '--- STDERR ---\\n' + atobSafe(result.stderr) + '\\n\\n';
+      if (!result.stdout && !result.stderr && !result.compile_output) out += '(no output)';
+      output.textContent = out;
+    } catch (e) {
+      output.textContent = 'Error: ' + (e.message || e);
+      console.error(e);
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  // Judge0 may return some fields base64 encoded depending on host settings.
+  // This helper attempts a safe decode, otherwise returns raw string.
+  function atobSafe(s) {
+    if (!s) return '';
+    try { return atob(s); } catch(_) { return s; }
+  }
+
+  // sample code toggle
+  sampleBtn.onclick = () => {
+    editor.setValue(`#include <stdio.h>
+int main(){
+  int a,b;
+  if(scanf("%d %d",&a,&b)==2) printf("%d\\n", a+b);
+  else printf("provide two ints\\n");
+  return 0;
+}`);
+  };
+
+  runBtn.onclick = runCode;
+
+  // initialize
+  loadLanguages();
+  </script>
+</body>
+</html>
